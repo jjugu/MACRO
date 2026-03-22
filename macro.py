@@ -185,14 +185,44 @@ class SeatMacroEngine:
         self.driver.switch_to.window(handles[-1])
         self.log(f"[연결] 마지막 창으로 전환: {self.driver.title}")
 
+    def _wait_and_click_booking(self):
+        """예매하기 버튼이 비활성화 상태면 활성화될 때까지 대기 후 즉시 클릭"""
+        try:
+            btn = self.driver.find_element(By.CSS_SELECTOR, ".sideBtn.is-primary")
+        except NoSuchElementException:
+            return False
+        data_check = btn.get_attribute("data-check")
+        if data_check != "true" and "is-disabled" not in (btn.get_attribute("class") or ""):
+            return False  # 이미 활성화 — 일반 클릭 진행
+
+        self.log("[대기] 예매 오픈 대기 중... (버튼 활성화 감지 시 즉시 클릭)")
+        while self.running:
+            try:
+                btn = self.driver.find_element(By.CSS_SELECTOR, ".sideBtn.is-primary")
+                dc = btn.get_attribute("data-check")
+                cls = btn.get_attribute("class") or ""
+                if dc != "true" and "is-disabled" not in cls:
+                    self.log("[대기] 버튼 활성화 감지! 즉시 클릭")
+                    btn.click()
+                    return True
+            except Exception:
+                pass
+            time.sleep(0.1)
+        return False
+
     def _click_booking_button(self):
         """상세 페이지에서 예매하기 버튼 클릭 → 팝업 열림 대기 → 전환"""
         before_handles = set(self.driver.window_handles)
 
-        # 예매하기 버튼 클릭 (Selenium 직접 클릭 — JS click은 팝업 차단됨)
+        # 예매하기 버튼이 비활성화 상태면 활성화 대기
         try:
             btn = self.driver.find_element(By.CSS_SELECTOR, ".sideBtn.is-primary")
-            btn.click()
+            if self._wait_and_click_booking():
+                # 대기 후 클릭 완료
+                pass
+            else:
+                # 이미 활성화 — 바로 클릭
+                btn.click()
         except NoSuchElementException:
             self.log("[연결] 예매하기 버튼을 찾을 수 없음")
             return
