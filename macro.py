@@ -49,6 +49,7 @@ DEFAULT_CONFIG = {
     "auto_refresh": True,
     "consecutive_seats": True,
     "stealth_mode": True,           # navigator.webdriver 탐지 방지
+    "captcha_reopen": True,         # H/R 캡차 시 창 닫고 재오픈 (False면 텔레그램 알림+정지)
     "telegram_token": "",
     "telegram_chat_id": "",
 }
@@ -141,40 +142,125 @@ class SeatMacroEngine:
             return False
 
     # ── 예매 팝업 창 전환 ──
-    def _switch_to_booking_window(self):
-        """여러 창 중 예매 페이지(BookMain) 팝업으로 전환"""
-        handles = self.driver.window_handles
-        self.log(f"[연결] 열린 창 {len(handles)}개 감지")
-
-        if len(handles) <= 1:
-            self.log("[연결] 단일 창 - 전환 불필요")
-            return
-
-        best = None
-        for h in handles:
+    def _find_booking_window(self):
+        """열린 창 중 예매 팝업(BookMain) 핸들 반환, 없으면 None"""
+        for h in self.driver.window_handles:
             try:
                 self.driver.switch_to.window(h)
                 url = self.driver.current_url or ""
                 title = self.driver.title or ""
-                self.log(f"  창: {title[:40]} | {url[:60]}")
-
-                # BookMain, Book, 좌석 선택 등 예매 관련 키워드
                 if any(kw in url.lower() for kw in ["bookmain", "book/book", "seatselect"]):
-                    best = h
-                    break
-                if any(kw in title for kw in ["좌석 선택", "좌석선택", "예매"]):
-                    best = h
-                    break
+                    return h
+                if any(kw in title for kw in ["좌석 선택", "좌석선택"]):
+                    return h
             except Exception:
                 continue
+        return None
+
+    def _switch_to_booking_window(self):
+        """여러 창 중 예매 페이지(BookMain) 팝업으로 전환, 없으면 예매하기 버튼 클릭"""
+        handles = self.driver.window_handles
+        self.log(f"[연결] 열린 창 {len(handles)}개 감지")
+
+        best = self._find_booking_window()
 
         if best:
             self.driver.switch_to.window(best)
             self.log(f"[연결] 예매 창으로 전환 완료: {self.driver.title}")
-        else:
-            # 못 찾으면 마지막 창(가장 최근 팝업)으로
-            self.driver.switch_to.window(handles[-1])
-            self.log(f"[연결] 마지막 창으로 전환: {self.driver.title}")
+            return
+
+        # 예매 팝업이 없으면 상세 페이지에서 예매하기 버튼 클릭 시도
+        for h in handles:
+            try:
+                self.driver.switch_to.window(h)
+                url = self.driver.current_url or ""
+                if "tickets.interpark.com/goods/" in url:
+                    self.log("[연결] 상세 페이지 감지 → 예매하기 버튼 클릭")
+                    self._click_booking_button()
+                    return
+            except Exception:
+                continue
+
+        # 그래도 못 찾으면 마지막 창
+        self.driver.switch_to.window(handles[-1])
+        self.log(f"[연결] 마지막 창으로 전환: {self.driver.title}")
+
+    def _click_booking_button(self):
+        """상세 페이지에서 예매하기 버튼 클릭 → 팝업 열림 대기 → 전환"""
+        before_handles = set(self.driver.window_handles)
+
+        # 예매하기 버튼 클릭 (Selenium 직접 클릭 — JS click은 팝업 차단됨)
+        try:
+            btn = self.driver.find_element(By.CSS_SELECTOR, ".sideBtn.is-primary")
+            btn.click()
+        except NoSuchElementException:
+            self.log("[연결] 예매하기 버튼을 찾을 수 없음")
+            return
+
+        self.log("[연결] 예매하기 클릭! 팝업 대기 중...")
+
+        # 새 팝업 창 대기 (최대 15초)
+        for _ in range(30):
+            time.sleep(0.5)
+            new_handles = set(self.driver.window_handles) - before_handles
+            if new_handles:
+                new_handle = new_handles.pop()
+                self.driver.switch_to.window(new_handle)
+                # 페이지 로딩 대기
+                for _ in range(20):
+                    try:
+                        url = self.driver.current_url or ""
+                        if "book" in url.lower() or "poticket" in url.lower():
+                            self.log(f"[연결] 예매 팝업 열림: {self.driver.title}")
+                            return
+                    except Exception:
+                        pass
+                    time.sleep(0.5)
+                self.log(f"[연결] 새 창으로 전환: {self.driver.title}")
+                return
+
+        self.log("[연결] 예매 팝업이 열리지 않음 (날짜/회차를 먼저 선택해주세요)")
+
+    # ── 예매창 재오픈 (H/R 캡차 우회) ──
+    def _reopen_booking_window(self):
+        """현재 예매 팝업을 닫고 상세 페이지에서 다시 열기"""
+        try:
+            # 상세 페이지 핸들 찾기
+            detail_handle = None
+            for h in self.driver.window_handles:
+                self.driver.switch_to.window(h)
+                if "tickets.interpark.com/goods/" in (self.driver.current_url or ""):
+                    detail_handle = h
+                    break
+
+            if not detail_handle:
+                self.log("[재오픈] 상세 페이지를 찾을 수 없음")
+                return False
+
+            # 예매 팝업 닫기
+            booking = self._find_booking_window()
+            if booking:
+                self.driver.switch_to.window(booking)
+                self.driver.close()
+                self.log("[재오픈] 예매창 닫음")
+
+            # 상세 페이지로 전환 → 예매하기 클릭
+            self.driver.switch_to.window(detail_handle)
+            time.sleep(0.5)
+            self._click_booking_button()
+
+            # 새 예매창 확인
+            new_booking = self._find_booking_window()
+            if new_booking:
+                self.driver.switch_to.window(new_booking)
+                self.log("[재오픈] 새 예매창 열림!")
+                return True
+
+            self.log("[재오픈] 새 예매창이 열리지 않음")
+            return False
+        except Exception as e:
+            self.log(f"[재오픈] 오류: {e}")
+            return False
 
     # ── 스텔스 모드 ──
     def _inject_stealth(self):
@@ -273,9 +359,19 @@ class SeatMacroEngine:
                             else:
                                 self._solve_text_captcha()
                         elif cap_type in ('H', 'R') and not captcha_handled:
-                            # hCaptcha/reCAPTCHA: 사용자가 풀어야 함
-                            self.log("[캡차] 체크박스를 클릭해주세요!")
                             captcha_handled = True
+                            if self.config.get("captcha_reopen", True):
+                                # 창 닫고 재오픈으로 우회 시도
+                                self.log(f"[캡차] {cap_type}타입 감지 → 예매창 재오픈")
+                                if self._reopen_booking_window():
+                                    return self.enter_seat_detail()
+                                self.log("[캡차] 재오픈 실패 — 체크박스를 직접 클릭해주세요!")
+                            else:
+                                # 텔레그램 알림 + 정지
+                                self.log(f"[캡차] {cap_type}타입 감지 → 매크로 정지")
+                                self.send_telegram(f"[캡차] {cap_type}타입 캡차 발생! 수동 처리 필요")
+                                self.running = False
+                                return False
                         time.sleep(0.1)
                         continue
                 except Exception:
@@ -379,7 +475,7 @@ class SeatMacroEngine:
                 return
 
     def enter_frame(self):
-        """ifrmSeat 진입 (등급/구역 클릭용)"""
+        """ifrmSeat 진입 (등급/구역 클릭용) — 실패 시 False"""
         self.driver.switch_to.default_content()
         try:
             self.driver.switch_to.frame(self.driver.find_element(By.NAME, "ifrmSeat"))
@@ -392,7 +488,31 @@ class SeatMacroEngine:
                 return True
             except NoSuchElementException:
                 continue
-        return True
+        return False
+
+    def _ensure_booking_window(self):
+        """예매 팝업이 열려있는지 확인, 닫혔으면 재오픈"""
+        booking = self._find_booking_window()
+        if booking:
+            self.driver.switch_to.window(booking)
+            return True
+        # 예매창이 없으면 상세 페이지에서 다시 열기
+        self.log("[연결] 예매창이 닫혔습니다. 재오픈 시도...")
+        for h in self.driver.window_handles:
+            try:
+                self.driver.switch_to.window(h)
+                if "tickets.interpark.com/goods/" in (self.driver.current_url or ""):
+                    self._click_booking_button()
+                    new_booking = self._find_booking_window()
+                    if new_booking:
+                        self.driver.switch_to.window(new_booking)
+                        self.log("[연결] 예매창 재오픈 성공!")
+                        return True
+            except Exception:
+                continue
+        self.log("[연결] 예매창 재오픈 실패")
+        self.send_telegram("[연결] 예매창이 닫혔고 재오픈에 실패했습니다. 확인이 필요합니다!")
+        return False
 
 
     # ── 좌석등급 ──
@@ -913,7 +1033,12 @@ class SeatMacroEngine:
                     continue
 
                 self.dismiss_alert()
-                self.enter_frame()
+                if not self.enter_frame():
+                    # 예매창이 닫힌 경우 재오픈 시도
+                    if not self._ensure_booking_window():
+                        time.sleep(3)
+                        continue
+                    self.enter_frame()
                 self._check_and_solve_text_captcha()
 
                 grade, sec = plan[plan_index]
@@ -959,8 +1084,14 @@ class SeatMacroEngine:
                             self.log("━" * 40)
                             self.log("  ★ 예매 성공! 결제로 이동합니다 ★")
                             self.log("━" * 40)
+                            concert = ""
+                            try:
+                                concert = self.driver.title or ""
+                            except Exception:
+                                pass
                             self.send_telegram(
                                 f"[인터파크 매크로] 예매 성공!\n"
+                                f"공연: {concert}\n"
                                 f"등급: {grade or '현재'}\n"
                                 f"구역: {sec or '현재'}\n"
                                 f"좌석 {selected}석 선택 완료!")
@@ -1024,6 +1155,7 @@ class App(ctk.CTk if HAS_CTK else tk.Tk):
             "auto_refresh": self.var_autoref.get(),
             "consecutive_seats": self.var_consec.get(),
             "stealth_mode": self.var_stealth.get(),
+            "captcha_reopen": self.var_cap_reopen.get(),
             "telegram_token": self.var_tg_token.get(),
             "telegram_chat_id": self.var_tg_chatid.get(),
         }
@@ -1042,6 +1174,7 @@ class App(ctk.CTk if HAS_CTK else tk.Tk):
         self.var_autoref  = tk.BooleanVar(value=self.config.get("auto_refresh", True))
         self.var_consec   = tk.BooleanVar(value=self.config.get("consecutive_seats", True))
         self.var_stealth  = tk.BooleanVar(value=self.config.get("stealth_mode", True))
+        self.var_cap_reopen = tk.BooleanVar(value=self.config.get("captcha_reopen", True))
         self.var_tg_token = tk.StringVar(value=self.config.get("telegram_token", ""))
         self.var_tg_chatid= tk.StringVar(value=self.config.get("telegram_chat_id", ""))
 
@@ -1153,6 +1286,12 @@ class App(ctk.CTk if HAS_CTK else tk.Tk):
         ctk.CTkCheckBox(r2, text="스텔스 모드", variable=self.var_stealth,
                         checkbox_width=16, checkbox_height=16).pack(side="left")
 
+        r2b = ctk.CTkFrame(parent, fg_color="transparent")
+        r2b.pack(fill="x", padx=12, pady=2)
+        ctk.CTkCheckBox(r2b, text="H/R캡차 시 창 재오픈 (해제 시 텔레그램 알림+정지)",
+                        variable=self.var_cap_reopen,
+                        checkbox_width=16, checkbox_height=16).pack(side="left")
+
         r3 = ctk.CTkFrame(parent, fg_color="transparent")
         r3.pack(fill="x", padx=12, pady=(4, 8))
         ctk.CTkLabel(r3, text="텔레그램", font=ctk.CTkFont(size=11)).pack(side="left", padx=(0, 4))
@@ -1206,7 +1345,7 @@ class App(ctk.CTk if HAS_CTK else tk.Tk):
             messagebox.showerror("텔레그램", f"전송 실패:\n{e}")
 
     def scan_grades(self):
-        """크롬 페이지에서 등급 스캔 → 필드에 채우기"""
+        """크롬 페이지에서 등급 스캔 → 필드에 채우기 (상세 페이지 / 예매 팝업 모두 지원)"""
         port = self.var_port.get()
         if not SeatMacroEngine._check_port(int(port)):
             messagebox.showwarning("등급 스캔", "Chrome이 연결되어 있지 않습니다.\n먼저 크롬 디버그 실행 후 예매 페이지를 열어주세요.")
@@ -1216,59 +1355,78 @@ class App(ctk.CTk if HAS_CTK else tk.Tk):
             opts.debugger_address = f"127.0.0.1:{port}"
             driver = webdriver.Chrome(options=opts)
 
-            # 예매 팝업 창 전환
+            found = []
+
+            # 1차: 상세 페이지(tickets.interpark.com)에서 등급 스캔
             for h in driver.window_handles:
                 try:
                     driver.switch_to.window(h)
-                    url = (driver.current_url or "").lower()
-                    if any(kw in url for kw in ["bookmain", "book/book", "seatselect"]):
-                        break
+                    url = driver.current_url or ""
+                    if "tickets.interpark.com/goods/" in url:
+                        items = driver.find_elements(By.CSS_SELECTOR, ".infoPriceItem")
+                        for item in items:
+                            txt = (item.text or "").strip()
+                            # "스탠딩석\n165,000원" → "스탠딩석"
+                            name = txt.split("\n")[0].strip()
+                            if name and "석" in name and "전체" not in name and name not in found:
+                                found.append(name)
+                        if found:
+                            self.append_log(f"[스캔] 상세 페이지에서 등급 {len(found)}개 감지: {', '.join(found)}")
+                            break
                 except Exception:
                     continue
 
-            # ifrmSeat 진입
-            driver.switch_to.default_content()
-            try:
-                driver.switch_to.frame(driver.find_element(By.NAME, "ifrmSeat"))
-            except NoSuchElementException:
-                for name in ["ifrmBookMain", "BookSeat", "SeatFrame", "mainFrame"]:
-                    try:
-                        driver.switch_to.frame(driver.find_element(By.NAME, name))
-                        break
-                    except NoSuchElementException:
-                        continue
-
-            # 등급 스캔 — <strong> 태그 기반
-            found = []
-            for s in driver.find_elements(By.TAG_NAME, "strong"):
-                try:
-                    txt = (s.text or "").strip()
-                    if txt and "석" in txt and len(txt) < 20 and s.is_displayed():
-                        if txt not in found:
-                            found.append(txt)
-                except Exception:
-                    continue
-            # 폴백: span.select with fnSwapGrade
+            # 2차: 예매 팝업(BookMain)에서 등급 스캔
             if not found:
-                import re
-                for s in driver.find_elements(By.CSS_SELECTOR, "span.select"):
+                for h in driver.window_handles:
                     try:
-                        onclick = s.get_attribute("onclick") or ""
-                        if "fnSwapGrade" not in onclick:
-                            continue
-                        txt = (s.text or "").strip()
-                        clean = re.sub(r'\s*\d+석.*$', '', txt).strip()
-                        if clean and clean not in found:
-                            found.append(clean)
+                        driver.switch_to.window(h)
+                        url = (driver.current_url or "").lower()
+                        if any(kw in url for kw in ["bookmain", "book/book", "seatselect"]):
+                            break
                     except Exception:
                         continue
 
+                driver.switch_to.default_content()
+                try:
+                    driver.switch_to.frame(driver.find_element(By.NAME, "ifrmSeat"))
+                except NoSuchElementException:
+                    for name in ["ifrmBookMain", "BookSeat", "SeatFrame", "mainFrame"]:
+                        try:
+                            driver.switch_to.frame(driver.find_element(By.NAME, name))
+                            break
+                        except NoSuchElementException:
+                            continue
+
+                for s in driver.find_elements(By.TAG_NAME, "strong"):
+                    try:
+                        txt = (s.text or "").strip()
+                        if txt and "석" in txt and len(txt) < 20 and s.is_displayed():
+                            if txt not in found:
+                                found.append(txt)
+                    except Exception:
+                        continue
+                if not found:
+                    import re
+                    for s in driver.find_elements(By.CSS_SELECTOR, "span.select"):
+                        try:
+                            onclick = s.get_attribute("onclick") or ""
+                            if "fnSwapGrade" not in onclick:
+                                continue
+                            txt = (s.text or "").strip()
+                            clean = re.sub(r'\s*\d+석.*$', '', txt).strip()
+                            if clean and clean not in found:
+                                found.append(clean)
+                        except Exception:
+                            continue
+                if found:
+                    self.append_log(f"[스캔] 예매 팝업에서 등급 {len(found)}개 감지: {', '.join(found)}")
+
             if found:
-                self.append_log(f"[스캔] 등급 {len(found)}개 감지: {', '.join(found)}")
                 self._show_grade_selector(found)
             else:
                 self.append_log("[스캔] 등급을 찾지 못했습니다")
-                messagebox.showwarning("등급 스캔", "등급을 찾지 못했습니다.\n예매 좌석선택 페이지가 열려있는지 확인하세요.")
+                messagebox.showwarning("등급 스캔", "등급을 찾지 못했습니다.\n상세 페이지 또는 예매 페이지가 열려있는지 확인하세요.")
         except Exception as e:
             self.append_log(f"[스캔] 오류: {e}")
             messagebox.showerror("등급 스캔", f"스캔 실패:\n{e}")
