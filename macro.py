@@ -892,18 +892,27 @@ class SeatMacroEngine:
                         self._smart_click(e)
                         self.log("[완료] 좌석선택완료 버튼 클릭!")
 
-                        # 클릭 후 알림 확인 — "좌석을 선택하세요" 등 에러면 실패 처리
-                        time.sleep(0.5)
-                        try:
-                            alert = self.driver.switch_to.alert
-                            alert_text = alert.text or ""
-                            if any(kw in alert_text for kw in ["선택하세요", "선택해", "좌석을 선택"]):
-                                self.log(f"[완료] 실패 알림: {alert_text}")
+                        # 클릭 후 서버 블로킹 응답 대기 + 알림 확인
+                        # frmInfo → ifrmInfo POST 후 서버 응답에 시간 소요
+                        for _wait in range(6):
+                            time.sleep(0.5)
+                            try:
+                                alert = self.driver.switch_to.alert
+                                alert_text = alert.text or ""
+                                self.log(f"[완료] 알림: {alert_text}")
                                 alert.accept()
-                                return False
-                            alert.accept()
-                        except (NoAlertPresentException, Exception):
-                            pass
+                                # 실패 패턴: 좌석 미선택, 이미 선택, 종료, 다시
+                                fail_keywords = [
+                                    "선택하세요", "선택해", "좌석을 선택",
+                                    "이미 선택", "이미선택", "이미 예매",
+                                    "다른 고객", "선점", "먼저 선택",
+                                    "초과했습니다", "종료되었습니다",
+                                    "다시 진행", "다시 선택",
+                                ]
+                                if any(kw in alert_text for kw in fail_keywords):
+                                    return False
+                            except (NoAlertPresentException, Exception):
+                                pass
                         return True
                 except Exception:
                     continue
@@ -1098,7 +1107,15 @@ class SeatMacroEngine:
                             self.running = False
                             return
                         else:
-                            self.log("[재시도] 완료 버튼 실패...")
+                            self.log("[재시도] 좌석 선점 실패 → 같은 구역 재탐색")
+                            # 선택된 좌석 초기화 + 좌석 새로고침
+                            try:
+                                self.enter_frame()
+                                self.driver.execute_script("fnInitSeat(); fnRefresh();")
+                                time.sleep(1)
+                            except Exception:
+                                pass
+                            continue  # 다음 구역으로 넘기지 않고 같은 구역 재시도
                 else:
                     self.log(f"[탐색] 좌석 없음 → 다음")
 
