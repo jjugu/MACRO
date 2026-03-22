@@ -1,0 +1,13 @@
+{
+  "debug_port": 9222,
+  "seat_grade": "R석,S석",
+  "sections": "",
+  "num_seats": 2,
+  "max_attempts": 10000000000,
+  "refresh_interval": 1.0,
+  "auto_refresh": false,
+  "consecutive_seats": true,
+  "stealth_mode": true,
+  "telegram_token": "8531445789:AAELr6a4UGFKPNU-ISlZZZFIQsi_vq_8vDA",
+  "telegram_chat_id": "2029869867"
+}
