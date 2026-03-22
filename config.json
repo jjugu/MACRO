@@ -1,6 +1,6 @@
 {
   "debug_port": 9222,
-  "seat_grade": "R석,S석",
+  "seat_grade": "지정석 VIP석,지정석 R석",
   "sections": "",
   "num_seats": 2,
   "max_attempts": 10000000000,

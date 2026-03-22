@@ -30,6 +30,11 @@ from selenium.common.exceptions import (
     InvalidSessionIdException,
     WebDriverException,
 )
+try:
+    import ddddocr
+    HAS_OCR = True
+except ImportError:
+    HAS_OCR = False
 
 
 CONFIG_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "config.json")
@@ -62,6 +67,7 @@ class SeatMacroEngine:
         self.driver = None
         self.running = False
         self.section_index = 0  # 현재 시도할 구역 인덱스
+        self._ocr = None
 
     def stop(self):
         self.running = False
@@ -259,6 +265,13 @@ class SeatMacroEngine:
                                 """)
                                 self.log("[캡차] 슬라이더 우회 (폴백)")
                             captcha_handled = True
+                        elif cap_type == 'T' and not captcha_handled:
+                            # 문자입력 캡차: ddddocr OCR 자동 풀이
+                            captcha_handled = True
+                            if not HAS_OCR:
+                                self.log("[캡차] 문자를 직접 입력해주세요! (ddddocr 미설치)")
+                            else:
+                                self._solve_text_captcha()
                         elif cap_type in ('H', 'R') and not captcha_handled:
                             # hCaptcha/reCAPTCHA: 사용자가 풀어야 함
                             self.log("[캡차] 체크박스를 클릭해주세요!")
@@ -283,6 +296,87 @@ class SeatMacroEngine:
             except NoSuchElementException:
                 continue
         return True
+
+    def _check_and_solve_text_captcha(self):
+        """ifrmSeat 진입 후 문자 캡차가 표시되어 있으면 풀고 진행"""
+        try:
+            visible = self.driver.execute_script("""
+                var wrap = document.getElementById('divCaptchaWrap');
+                var img = document.getElementById('imgCaptcha');
+                return wrap && wrap.offsetWidth > 0 && img && img.style.display !== 'none';
+            """)
+            if visible:
+                if not HAS_OCR:
+                    self.log("[캡차] 문자를 직접 입력해주세요! (ddddocr 미설치)")
+                    while self.running:
+                        still = self.driver.execute_script(
+                            "var w=document.getElementById('divCaptchaWrap');"
+                            "return w && w.offsetWidth>0;")
+                        if not still:
+                            break
+                        time.sleep(0.5)
+                else:
+                    self._solve_text_captcha()
+        except Exception:
+            pass
+
+    def _ocr_captcha_image(self, img_bytes):
+        """캡차 이미지 전처리 + OCR (이진화 반전으로 90% 정확도)"""
+        from PIL import Image, ImageOps
+        import io as _io
+        img = Image.open(_io.BytesIO(img_bytes)).convert('L')  # 그레이스케일
+        bw = img.point(lambda x: 255 if x > 140 else 0)       # 이진화
+        inv = ImageOps.invert(bw)                               # 반전 (검정 글씨 + 흰 배경)
+        buf = _io.BytesIO()
+        inv.save(buf, 'PNG')
+        return self._ocr.classification(buf.getvalue()).upper().strip()
+
+    def _solve_text_captcha(self, max_retry=5):
+        """문자입력 캡차 자동 풀이 (ddddocr OCR)"""
+        import base64
+        if self._ocr is None:
+            self._ocr = ddddocr.DdddOcr(show_ad=False)
+        for attempt in range(max_retry):
+            try:
+                img_src = self.driver.execute_script(
+                    'return document.getElementById("imgCaptcha").src')
+                if not img_src or ',' not in img_src:
+                    self.log("[캡차] 이미지를 가져올 수 없음")
+                    return
+                img_bytes = base64.b64decode(img_src.split(',')[1])
+                answer = self._ocr_captcha_image(img_bytes)
+                if len(answer) != 6:
+                    self.log(f"[캡차] OCR 결과 길이 불일치({answer}), 새로고침")
+                    self.driver.execute_script('fnCapchaRefresh()')
+                    time.sleep(0.8)
+                    continue
+                # 입력 필드 활성화 → 값 입력 → fnCheck() 호출
+                self.driver.execute_script('jQuery(".validationTxt").trigger("click")')
+                time.sleep(0.3)
+                self.driver.execute_script("""
+                    jQuery("#txtCaptcha").val(arguments[0]).show().focus();
+                    jQuery(".validationTxt").addClass("txtSet").removeClass("alert");
+                """, answer)
+                time.sleep(0.1)
+                self.driver.execute_script('fnCheck()')
+                time.sleep(1.5)
+                # 캡차 해결 확인
+                solved = self.driver.execute_script("""
+                    var w = document.getElementById('divCaptchaWrap');
+                    var gone = !w || w.offsetWidth === 0;
+                    var passed = jQuery('#rcckYN').val() === 'Y';
+                    return gone || passed;
+                """)
+                if solved:
+                    self.log(f"[캡차] 문자 자동 풀이 성공 ({answer})")
+                    time.sleep(0.5)
+                    return
+                else:
+                    self.log(f"[캡차] 오답({answer}), 재시도 {attempt+1}/{max_retry}")
+                    time.sleep(0.5)
+            except Exception as e:
+                self.log(f"[캡차] OCR 오류: {e}")
+                return
 
     def enter_frame(self):
         """ifrmSeat 진입 (등급/구역 클릭용)"""
@@ -753,6 +847,7 @@ class SeatMacroEngine:
         self.log("━" * 40)
 
         self.enter_frame()
+        self._check_and_solve_text_captcha()
 
         # 등급 목록 — 키워드 입력 시 페이지 스캔 후 매칭
         grade_input = [s.strip() for s in self.config.get("seat_grade", "").split(",") if s.strip()]
@@ -819,6 +914,7 @@ class SeatMacroEngine:
 
                 self.dismiss_alert()
                 self.enter_frame()
+                self._check_and_solve_text_captcha()
 
                 grade, sec = plan[plan_index]
                 label = f"{grade} > {sec}" if grade and sec else (grade or sec or "-")
